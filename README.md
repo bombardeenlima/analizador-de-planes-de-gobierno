@@ -1,52 +1,66 @@
 # Analizador de Planes de Gobierno
 
-Herramientas para extraer y visualizar propuestas a partir de planes de gobierno en formato PDF/TXT.
+Herramientas para extraer, verificar y visualizar propuestas a partir de planes de gobierno en formato PDF/TXT.
 
 ## Componentes clave
-- `analizar_planes.py`: limpia los documentos, segmenta propuestas y genera `propuestas.csv`, bitácora (`log.txt`) y extractos por distrito (`extractos/`).
-- `graficos_propuestas.py`: crea visualizaciones a partir del CSV (barras, pastel, timeline y nube de palabras/Top tokens).
-- `verbos.txt`: banco externo de verbos y patrones que controlan la detección de propuestas; se puede ampliar sin tocar el código.
-- `propuestas/`: carpeta de entrada por defecto para los planes de gobierno.
+- `scripts/analizar_planes.py`: limpia los documentos fuente (`datos/propuestas/`), segmenta propuestas y genera `propuestas.csv`, bitácora (`log.txt`) y extractos (`extractos/`).
+- `scripts/evaluar_propuestas.py`: cruza `propuestas.csv` contra los indicadores en `datos/informacion/` para emitir `evaluacion_propuestas.csv`.
+- `scripts/graficos_propuestas.py`: crea visualizaciones enriquecidas a partir de ambos CSV (barras, heatmaps, stacked bars, timelines y nube/top de palabras).
+- `pipeline.py`: orquestador que permite ejecutar los pasos anteriores de forma secuencial u opciones puntuales mediante `--steps`.
+- `datos/verbos.txt`: banco externo de verbos y patrones que controlan la detección de propuestas; se puede ampliar sin tocar el código.
 
 ## Requisitos
 Python 3.10+ y las dependencias opcionales:
 
 ```bash
-pip install pdfminer.six PyPDF2 matplotlib wordcloud pandas
+pip install pdfminer.six PyPDF2 pandas matplotlib seaborn wordcloud
 ```
 
 - `pdfminer.six` y `PyPDF2` habilitan la extracción de texto desde PDF.
-- `matplotlib` y `wordcloud` son necesarias para los gráficos (sin `wordcloud` se genera un gráfico de barras de palabras).
-- `pandas` acelera la lectura del CSV (si falta se usa `csv.DictReader`).
+- `pandas` facilita el tratamiento de datos tabulares.
+- `matplotlib`, `seaborn` y `wordcloud` son necesarias para los gráficos (sin `wordcloud` se genera un top de palabras).
 
-## Uso básico
+## Estructura de carpetas
+```
+datos/
+├─ propuestas/              # PDFs / TXTs originales
+├─ informacion/             # Indicadores y fuentes externas
+└─ verbos.txt               # Bancos de verbos y patrones
+graficos/                   # Salida de visualizaciones
+propuestas.csv              # Resultado de extracción
+evaluacion_propuestas.csv   # Resultado de verificación
+scripts/                    # Herramientas principales
+```
+
+## Ejecución manual por paso
+### 1. Extraer propuestas
 ```bash
-python3 analizar_planes.py \
-  --input propuestas \
+python scripts/analizar_planes.py \
+  --input datos/propuestas \
   --output propuestas.csv
 ```
+Opciones relevantes:
+- `--input`: carpeta con PDFs/TXT (default `datos/propuestas`).
+- `--output`: CSV resultante (default `propuestas.csv`).
+- `--skip-charts`: evita crear gráficos automáticamente.
 
-### Opciones relevantes
-- `--input`: carpeta con PDFs/TXT (default `./propuestas`).
-- `--output`: nombre del CSV resultante (default `propuestas.csv`).
-- `--skip-charts`: evita la generación automática de gráficos.
-
-El script muestra el progreso por archivo y resume el total de propuestas, factibilidad y timeline. Al finalizar crea la carpeta `graficos/` con las figuras cuando no se usa `--skip-charts`.
-
-## Generación de gráficos independiente
+### 2. Verificar propuestas con data externa
 ```bash
-python3 graficos_propuestas.py --csv propuestas.csv --out graficos
+python scripts/evaluar_propuestas.py
 ```
-Produce:
-- `propuestas_por_distrito.png`
-- `factibilidad.png`
-- `timeline.png`
-- `nube_palabras.png` (o `top_palabras.png` si falta `wordcloud`)
+Genera/actualiza `evaluacion_propuestas.csv` con el estado de cada propuesta (`cumplida`, `en_progreso`, `no_cumplida`, `sin_datos`) y un detalle justificando la clasificación.
 
-Los avisos en consola indican dependencias faltantes o datos insuficientes.
+### 3. Generar gráficos
+```bash
+python scripts/graficos_propuestas.py \
+  --csv propuestas.csv \
+  --evaluacion evaluacion_propuestas.csv \
+  --out graficos
+```
+Produce visualizaciones comparables entre distritos y métricas (barras, heatmaps, stacked bars, timelines, nube/top palabras). Los avisos en consola indican dependencias faltantes o datos insuficientes.
 
 ## Personalización de detección
-Edita `verbos.txt` para añadir o ajustar:
+Edita `datos/verbos.txt` para añadir o ajustar:
 - `[ACTION_VERBS]`: verbos que suelen encabezar propuestas.
 - `[ACTION_NOMINALIZATIONS]`: patrones nominales de acción.
 - `[HARD_SIGNS]`, `[MEDIUM_SIGNS]`, `[LOW_SIGNS]`: pistas utilizadas para estimar factibilidad.
@@ -55,4 +69,5 @@ Los cambios se aplican en la siguiente ejecución sin modificar el código fuent
 
 ## Registros y validación
 - `log.txt` recoge advertencias/errores de extracción.
-- Se recomienda revisar manualmente muestras al azar para validar la calidad de las propuestas detectadas.
+- `extractos/` guarda fragmentos de texto por distrito para auditoría.
+- Se recomienda revisar manualmente muestras al azar para validar la calidad de las propuestas detectadas y los estados asignados.

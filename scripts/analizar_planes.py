@@ -22,11 +22,12 @@ import logging
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Iterable
 
-DEFAULT_INPUT_DIR = Path("./propuestas")
-OUTPUT_CSV = Path("propuestas.csv")
-EXTRACTS_DIR = Path("extractos")
-LOG_FILE = Path("log.txt")
-KEYWORD_FILE = Path("verbos.txt")
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_INPUT_DIR = BASE_DIR / "datos" / "propuestas"
+OUTPUT_CSV = BASE_DIR / "propuestas.csv"
+EXTRACTS_DIR = BASE_DIR / "extractos"
+LOG_FILE = BASE_DIR / "log.txt"
+KEYWORD_FILE = BASE_DIR / "datos" / "verbos.txt"
 
 # =============================
 # Bancos de palabras (por defecto)
@@ -440,9 +441,9 @@ def main():
                         format="%(asctime)s [%(levelname)s] %(message)s")
     parser = argparse.ArgumentParser(description="Analiza planes de gobierno y extrae propuestas -> CSV (v3).")
     parser.add_argument("-i","--input", type=str, default=str(DEFAULT_INPUT_DIR),
-                        help="Carpeta con .pdf/.txt (por defecto: ./propuestas)")
+                        help="Carpeta con .pdf/.txt (por defecto: ./datos/propuestas)")
     parser.add_argument("-o","--output", type=str, default=str(OUTPUT_CSV),
-                        help="CSV de salida (por defecto: propuestas.csv)")
+                        help="CSV de salida (por defecto: ./propuestas.csv)")
     parser.add_argument("--skip-charts", action="store_true",
                         help="No generar gráficos a partir del CSV resultante.")
     args = parser.parse_args()

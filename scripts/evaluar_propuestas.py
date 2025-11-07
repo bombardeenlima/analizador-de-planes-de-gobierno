@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -35,6 +36,7 @@ NOT_ACHIEVED = "no_cumplida"
 NO_DATA = "sin_datos"
 
 INFOBRAS_FILENAME_MAP: Dict[str, str] = {
+    # Explicit aliases help when the dataset usa abreviaturas poco comunes.
     "ate": "ate",
     "chaclacayo": "chaclacayo",
     "cieneguilla": "cieneguilla",
@@ -56,6 +58,13 @@ def _strip_accents(value: str) -> str:
     return without_marks.lower()
 
 
+def _normalize_column_label(label: str) -> str:
+    """Utility to normalize column labels for fuzzy matching."""
+    text = _strip_accents(str(label))
+    text = text.replace("%", " porcentaje ")
+    return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+
 def _keyword_present(text: str, tokens: Iterable[str]) -> bool:
     """Check if any token is present in the normalized text."""
     norm_text = _strip_accents(text)
@@ -68,6 +77,27 @@ def _load_csv(path: Path, **kwargs) -> pd.DataFrame:
         return pd.read_csv(path, **kwargs)
     except Exception as exc:  # pragma: no cover - defensive programming
         raise RuntimeError(f"Unable to read CSV file at {path}") from exc
+
+
+def _load_csv_dynamic(path: Path) -> Optional[pd.DataFrame]:
+    """
+    Best-effort CSV reader that tries several encoding/separator combinations.
+    Returns None when every attempt fails so the caller can skip the file.
+    """
+    attempts = [
+        {"encoding": "utf-8", "on_bad_lines": "skip", "low_memory": False},
+        {"encoding": "utf-8-sig", "on_bad_lines": "skip", "low_memory": False},
+        {"encoding": "latin-1", "on_bad_lines": "skip", "low_memory": False},
+        {"encoding": "latin-1", "sep": ";", "engine": "python", "on_bad_lines": "skip", "low_memory": False},
+        {"encoding": "utf-8", "sep": ";", "engine": "python", "on_bad_lines": "skip", "low_memory": False},
+        {"sep": None, "engine": "python", "on_bad_lines": "skip", "low_memory": False},
+    ]
+    for opts in attempts:
+        try:
+            return pd.read_csv(path, **opts)
+        except Exception:
+            continue
+    return None
 
 
 def _normalize_municipality_name(raw_name: str) -> str:
@@ -120,6 +150,127 @@ def _threshold_classification(
     return NOT_ACHIEVED
 
 
+class DatasetDiscovery:
+    """
+    Scans ./datos/informacion looking for CSV files and classifies them based on
+    their headers/content so downstream logic can stay agnostic to filenames.
+    """
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.frames: Dict[str, pd.DataFrame] = {}
+        self.infobras_tables: List[Tuple[Path, pd.DataFrame]] = []
+        if not root.exists():
+            return
+        self._scan_directory()
+
+    def get(self, name: str) -> pd.DataFrame:
+        frame = self.frames.get(name)
+        if frame is None:
+            return pd.DataFrame()
+        return frame.copy(deep=False)
+
+    def build_infobras_lookup(self) -> Dict[str, pd.DataFrame]:
+        lookup: Dict[str, pd.DataFrame] = {}
+        for path, table in self.infobras_tables:
+            split = self._split_by_district(table)
+            if not split:
+                key = _strip_accents(path.stem)
+                if not key:
+                    continue
+                lookup[key] = self._merge_frames(lookup.get(key), table)
+                continue
+            for district_key, subset in split.items():
+                lookup[district_key] = self._merge_frames(lookup.get(district_key), subset)
+        return {key: df.reset_index(drop=True) for key, df in lookup.items()}
+
+    def _scan_directory(self) -> None:
+        for path in sorted(self.root.rglob("*.csv")):
+            frame = _load_csv_dynamic(path)
+            if frame is None or frame.empty:
+                continue
+            category = self._classify(path, frame)
+            if category is None:
+                continue
+            if category == "infobras":
+                self.infobras_tables.append((path, frame))
+                continue
+            self.frames[category] = self._merge_frames(self.frames.get(category), frame)
+
+    def _classify(self, path: Path, frame: pd.DataFrame) -> Optional[str]:
+        columns = [_normalize_column_label(col) for col in frame.columns]
+        normalized_path = _normalize_column_label(path.stem)
+
+        def has_fragment(fragment: str) -> bool:
+            fragment = fragment.lower()
+            return any(fragment in col for col in columns)
+
+        def has_all(*fragments: str) -> bool:
+            return all(has_fragment(fragment) for fragment in fragments)
+
+        if has_fragment("violencia") or "violencia" in normalized_path:
+            if has_fragment("cantidad"):
+                return "violence_reports"
+
+        if has_fragment("dist_hecho") or (has_fragment("dist") and has_fragment("hecho")):
+            if has_fragment("cantidad") or has_fragment("numero_casos"):
+                return "police_reports"
+
+        if has_fragment("arbol"):
+            return "tree_management"
+
+        if has_fragment("agenda") or has_fragment("parque") or "cultural" in normalized_path:
+            return "cultural_agenda"
+
+        if has_fragment("control") and has_fragment("informe"):
+            return "control_services"
+
+        if has_fragment("pim") and (has_fragment("recaud") or has_fragment("ingreso")):
+            return "revenue_execution"
+
+        if has_fragment("municipalidad") and has_fragment("avance") and (
+            has_fragment("gasto") or "presupuesto" in normalized_path or has_fragment("presupuesto")
+        ):
+            return "budget_execution"
+
+        if has_fragment("municipalidad") and has_fragment("avance") and (
+            has_fragment("inversion") or has_fragment("proyecto") or has_fragment("obra")
+        ):
+            return "investment_execution"
+
+        if has_fragment("discap"):
+            return "disability_spending"
+
+        if has_fragment("ninez") or has_fragment("infancia") or has_fragment("adolescen") or has_fragment("juventud"):
+            return "childhood_spending"
+
+        if has_fragment("estado") and has_fragment("obra"):
+            return "infobras"
+
+        return None
+
+    @staticmethod
+    def _merge_frames(existing: Optional[pd.DataFrame], new: pd.DataFrame) -> pd.DataFrame:
+        if existing is None or existing.empty:
+            return new.copy()
+        return pd.concat([existing, new], ignore_index=True, sort=False)
+
+    @staticmethod
+    def _split_by_district(frame: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        for column in frame.columns:
+            normalized = _normalize_column_label(column)
+            if any(keyword in normalized for keyword in ("distrit", "municipalidad", "localidad")):
+                groups: Dict[str, pd.DataFrame] = {}
+                for key, subset in frame.groupby(column):
+                    normalized_key = _strip_accents(str(key).strip())
+                    if not normalized_key:
+                        continue
+                    groups[normalized_key] = subset.copy()
+                if groups:
+                    return groups
+        return {}
+
+
 @dataclass
 class MunicipalDatasets:
     """Container for the pre-processed indicators sourced from ./datos/informacion."""
@@ -134,56 +285,23 @@ class MunicipalDatasets:
     tree_management: pd.DataFrame
     cultural_agenda: pd.DataFrame
     control_services: pd.DataFrame
-    infobras_files: Dict[str, Path]
+    infobras_lookup: Dict[str, pd.DataFrame]
 
     @classmethod
     def load(cls) -> "MunicipalDatasets":
-        budget_execution = _load_csv(DATOS_DIR / "ejecucion_del_gasto.csv")
-        investment_execution = _load_csv(DATOS_DIR / "ejecucion_de_proyectos_de_inversion.csv")
-        disability_spending = _load_csv(DATOS_DIR / "gastos_orientados_a_personas_con_discapacidad.csv")
-        childhood_spending = _load_csv(DATOS_DIR / "recursos_para_gastos_en_ninez_y_adolescencia.csv")
-        revenue_execution = _load_csv(DATOS_DIR / "presupuesto_y_ejecucion_de_ingresos.csv")
-        police_reports = _load_csv(DATOS_DIR / "denuncias_policiales_2018_2025.csv")
-        violence_reports = _load_csv(DATOS_DIR / "violencia_contra_la_mujer_2018_2025.csv")
-        tree_management = _load_csv(
-            DATOS_DIR / "gestion_del_arboleado_urbano.csv",
-            sep=";",
-            encoding="latin-1",
-        )
-        cultural_agenda = _load_csv(
-            DATOS_DIR / "agendas_culturales_en_parques_zonales.csv",
-            encoding="utf-8-sig",
-        )
-        control_services = _load_csv(
-            DATOS_DIR / "servicios_de_control.csv",
-            encoding="latin-1",
-            engine="python",
-            usecols=range(14),
-            on_bad_lines="skip",
-        )
-
-        infobras_root = DATOS_DIR / "infobras"
-        infobras_files: Dict[str, Path] = {}
-        for file in infobras_root.glob("*.csv"):
-            stem = file.stem.lower()
-            infobras_files[stem] = file
-            infobras_files[stem.replace(" ", "")] = file
-            normalized = _strip_accents(stem)
-            infobras_files.setdefault(normalized, file)
-            infobras_files.setdefault(normalized.replace(" ", ""), file)
-
+        discovery = DatasetDiscovery(DATOS_DIR)
         return cls(
-            budget_execution=budget_execution,
-            investment_execution=investment_execution,
-            disability_spending=disability_spending,
-            childhood_spending=childhood_spending,
-            revenue_execution=revenue_execution,
-            police_reports=police_reports,
-            violence_reports=violence_reports,
-            tree_management=tree_management,
-            cultural_agenda=cultural_agenda,
-            control_services=control_services,
-            infobras_files=infobras_files,
+            budget_execution=discovery.get("budget_execution"),
+            investment_execution=discovery.get("investment_execution"),
+            disability_spending=discovery.get("disability_spending"),
+            childhood_spending=discovery.get("childhood_spending"),
+            revenue_execution=discovery.get("revenue_execution"),
+            police_reports=discovery.get("police_reports"),
+            violence_reports=discovery.get("violence_reports"),
+            tree_management=discovery.get("tree_management"),
+            cultural_agenda=discovery.get("cultural_agenda"),
+            control_services=discovery.get("control_services"),
+            infobras_lookup=discovery.build_infobras_lookup(),
         )
 
 
@@ -602,46 +720,15 @@ class ProposalEvaluator:
 
     def _handle_infobras(self, district: str) -> Optional[StatusResult]:
         key = _strip_accents(district)
-        path: Optional[Path] = None
-        filename_hint = INFOBRAS_FILENAME_MAP.get(key)
-        candidate_keys = []
-        if filename_hint:
-            normalized_hint = _strip_accents(filename_hint)
-            candidate_keys.extend([
-                filename_hint.lower(),
-                filename_hint.replace(" ", "").lower(),
-                normalized_hint,
-                normalized_hint.replace(" ", ""),
-            ])
-        normalized_key = key.replace(" ", "")
-        candidate_keys.extend([
-            key,
-            normalized_key,
-            key.replace(" ", ""),
-        ])
-        for candidate in candidate_keys:
-            candidate = candidate.lower()
-            if candidate in self.datasets.infobras_files:
-                path = self.datasets.infobras_files[candidate]
-                break
-        if path is None:
-            for stem, candidate_path in self.datasets.infobras_files.items():
-                stem_compact = stem.replace(" ", "")
-                if normalized_key in stem_compact or stem_compact in normalized_key:
-                    path = candidate_path
-                    break
-        if path is None:
+        frame = self._get_infobras_frame(key)
+        if frame is None or frame.empty:
             return None
-        frame = _load_csv(path)
-        if frame.empty or "Estado de la obra" not in [col.lower() for col in frame.columns]:
-            # Make the column lookup accent/spacing insensitive.
-            state_column = None
-            for col in frame.columns:
-                if _strip_accents(col) == "estado de obra" or "estado" in _strip_accents(col):
-                    state_column = col
-                    break
-        else:
-            state_column = "Estado de obra"
+        state_column = None
+        for col in frame.columns:
+            normalized = _normalize_column_label(col)
+            if "estado" in normalized or "situacion" in normalized:
+                state_column = col
+                break
         if not state_column or state_column not in frame.columns:
             return None
         counts = frame[state_column].fillna("Sin estado").value_counts()
@@ -668,6 +755,30 @@ class ProposalEvaluator:
             f"Obras finalizadas {finished}/{total}; en ejecución {in_progress}."
         )
         return status, detail
+
+    def _get_infobras_frame(self, key: str) -> Optional[pd.DataFrame]:
+        lookup = getattr(self.datasets, "infobras_lookup", {}) or {}
+        if not lookup:
+            return None
+        variations = {
+            key,
+            key.replace(" ", ""),
+        }
+        alias = INFOBRAS_FILENAME_MAP.get(key)
+        if alias:
+            alias_key = _strip_accents(alias)
+            variations.add(alias_key)
+            variations.add(alias_key.replace(" ", ""))
+        for variation in list(variations):
+            if variation in lookup:
+                return lookup[variation]
+        for candidate_key, frame in lookup.items():
+            compact_candidate = candidate_key.replace(" ", "")
+            if compact_candidate in variations or any(
+                variation in candidate_key or candidate_key in variation for variation in variations
+            ):
+                return frame
+        return None
 
 
 def evaluate_proposals(args: argparse.Namespace) -> None:
